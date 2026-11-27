@@ -24,7 +24,7 @@
  * International Registered Trademark & Property of PrestaShop SA
  */
 
-if (!defined('_CAN_LOAD_FILES_')) {
+if (!defined('_PS_VERSION_')) {
     exit;
 }
 
@@ -34,7 +34,7 @@ class PSCleaner extends Module
     {
         $this->name = 'pscleaner';
         $this->tab = 'administration';
-        $this->version = '2.2.0';
+        $this->version = '2.3.0';
         $this->author = 'PrestaShop';
         $this->need_instance = 0;
 
@@ -43,7 +43,7 @@ class PSCleaner extends Module
 
         $this->displayName = $this->trans('PrestaShop Cleaner', array(), 'Modules.Pscleaner.Admin');
         $this->description = $this->trans('PrestaShop helps you remove your catalog, orders and customers data in one go.', array(), 'Modules.Pscleaner.Admin');
-        $this->ps_versions_compliancy = array('min' => '1.7.1.0', 'max' => _PS_VERSION_);
+        $this->ps_versions_compliancy = array('min' => '8.0.0', 'max' => '9.99.99');
     }
 
     protected function getMultiShopValues($key)
@@ -165,8 +165,14 @@ class PSCleaner extends Module
         $tables = Db::getInstance()->executeS('SHOW TABLES LIKE "'.preg_replace('/([%_])/', '\\$1', _DB_PREFIX_).'%_\\_lang"');
         foreach ($tables as $table) {
             $table_lang = current($table);
-            $table = str_replace('_lang', '', $table_lang);
+            $table = preg_replace('/_lang$/', '', $table_lang);
             $id_table = 'id_'.preg_replace('/^'._DB_PREFIX_.'/', '', $table);
+
+            // Module tables such as psgdpr_consent_lang do not follow the
+            // id_<table> naming; their queries used to fail one by one.
+            if (!self::hasColumn($table, $id_table) || !self::hasColumn($table_lang, $id_table)) {
+                continue;
+            }
 
             $query = 'DELETE FROM `'.bqSQL($table_lang).'` WHERE `'.bqSQL($id_table).'` NOT IN (SELECT `'.bqSQL($id_table).'` FROM `'.bqSQL($table).'`)';
             if ($db->Execute($query)) {
@@ -187,8 +193,14 @@ class PSCleaner extends Module
         $tables = Db::getInstance()->executeS('SHOW TABLES LIKE "'.preg_replace('/([%_])/', '\\$1', _DB_PREFIX_).'%_\\_shop"');
         foreach ($tables as $table) {
             $table_shop = current($table);
-            $table = str_replace('_shop', '', $table_shop);
+            $table = preg_replace('/_shop$/', '', $table_shop);
             $id_table = 'id_'.preg_replace('/^'._DB_PREFIX_.'/', '', $table);
+
+            // Tables that do not follow the id_<table> naming (module tables,
+            // relation tables) are skipped; their queries used to fail one by one.
+            if (!self::hasColumn($table, $id_table) || !self::hasColumn($table_shop, $id_table)) {
+                continue;
+            }
 
             if (in_array($table_shop, array(_DB_PREFIX_.'carrier_tax_rules_group_shop'))) {
                 continue;
@@ -255,9 +267,9 @@ class PSCleaner extends Module
                 }
                 $db->execute('DELETE FROM `'._DB_PREFIX_.'address` WHERE id_manufacturer > 0 OR id_supplier > 0 OR id_warehouse > 0');
 
-                Image::deleteAllImages(_PS_PROD_IMG_DIR_);
-                if (!file_exists(_PS_PROD_IMG_DIR_)) {
-                    mkdir(_PS_PROD_IMG_DIR_);
+                Image::deleteAllImages(_PS_PRODUCT_IMG_DIR_);
+                if (!file_exists(_PS_PRODUCT_IMG_DIR_)) {
+                    mkdir(_PS_PRODUCT_IMG_DIR_);
                 }
                 foreach (scandir(_PS_MANU_IMG_DIR_) as $dir) {
                     if (preg_match('/^[0-9]+(\-(.*))?\.jpg$/', $dir)) {
@@ -593,6 +605,16 @@ class PSCleaner extends Module
             array('order_cart_rule', 'id_order', 'orders', 'id_order'),
             array('order_detail', 'id_order', 'orders', 'id_order'),
             array('order_detail_tax', 'id_order_detail', 'order_detail', 'id_order_detail'),
+            // PrestaShop 9 tables (the queries are skipped on PrestaShop 8)
+            array('shipment', 'id_order', 'orders', 'id_order'),
+            array('shipment_product', 'id_shipment', 'shipment', 'id_shipment'),
+            array('shipment_product', 'id_order_detail', 'order_detail', 'id_order_detail'),
+            array('customer_b2b', 'id_customer', 'customer', 'id_customer'),
+            array('business_entity_address', 'id_business_entity', 'business_entity', 'id_business_entity'),
+            array('business_entity_customer_b2b', 'id_business_entity', 'business_entity', 'id_business_entity'),
+            array('business_entity_identifier', 'id_business_entity', 'business_entity', 'id_business_entity'),
+            array('cart_rule_compatible_types', 'id_cart_rule', 'cart_rule', 'id_cart_rule'),
+            array('extra_property_definition_shop', 'id_extra_property_definition', 'extra_property_definition', 'id_extra_property_definition'),
             array('order_history', 'id_order', 'orders', 'id_order'),
             array('order_invoice', 'id_order', 'orders', 'id_order'),
             array('order_invoice_payment', 'id_order', 'orders', 'id_order'),
@@ -755,6 +777,29 @@ class PSCleaner extends Module
             'page_viewed',
             'product_sale',
             'referrer_cache',
+            // PrestaShop 9: order shipments and B2B customer accounts. The
+            // TRUNCATE of a table that does not exist (PrestaShop 8) is ignored.
+            'shipment',
+            'shipment_product',
+            'customer_b2b',
+            'business_entity',
+            'business_entity_address',
+            'business_entity_customer_b2b',
+            'business_entity_identifier',
+        );
+    }
+
+    /**
+     * @param string $table Full table name, with prefix
+     * @param string $column
+     *
+     * @return bool
+     */
+    protected static function hasColumn($table, $column)
+    {
+        return (bool) Db::getInstance()->getValue(
+            'SELECT COUNT(*) FROM information_schema.COLUMNS
+            WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = "'.pSQL($table).'" AND COLUMN_NAME = "'.pSQL($column).'"'
         );
     }
 }
