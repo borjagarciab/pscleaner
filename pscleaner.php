@@ -252,12 +252,15 @@ class PSCleaner extends Module
                 $db->execute('DELETE FROM `'._DB_PREFIX_.'category_shop` WHERE id_category NOT IN ('.implode(',', array_map('intval', $id_home)).', '.implode(',', array_map('intval', $id_root)).')');
                 $db->execute('DELETE FROM `'._DB_PREFIX_.'category_group` WHERE id_category NOT IN ('.implode(',', array_map('intval', $id_home)).', '.implode(',', array_map('intval', $id_root)).')');
                 $db->execute('ALTER TABLE `'._DB_PREFIX_.'category` AUTO_INCREMENT = '. (1 + max(array_merge($id_home, $id_root))));
-                foreach (scandir(_PS_CAT_IMG_DIR_) as $dir) {
-                    if (preg_match('/^[0-9]+(\-(.*))?\.jpg$/', $dir)) {
-                        unlink(_PS_CAT_IMG_DIR_.$dir);
-                    }
-                }
+                self::deleteEntityImages(_PS_CAT_IMG_DIR_);
+                // Files of product attachments and virtual products, before
+                // their tables are emptied.
+                self::deleteCatalogDownloads();
+
                 $tables = self::getCatalogRelatedTables();
+                foreach (self::getInstalledModulesTables('catalog') as $module_tables) {
+                    $tables = array_merge($tables, $module_tables);
+                }
                 foreach ($tables as $table) {
                     try{
                         $db->execute('TRUNCATE TABLE `'._DB_PREFIX_.bqSQL($table).'`');
@@ -267,35 +270,18 @@ class PSCleaner extends Module
                 }
                 $db->execute('DELETE FROM `'._DB_PREFIX_.'address` WHERE id_manufacturer > 0 OR id_supplier > 0 OR id_warehouse > 0');
 
-                Image::deleteAllImages(_PS_PRODUCT_IMG_DIR_);
+                self::deleteProductImages(_PS_PRODUCT_IMG_DIR_);
                 if (!file_exists(_PS_PRODUCT_IMG_DIR_)) {
                     mkdir(_PS_PRODUCT_IMG_DIR_);
                 }
-                foreach (scandir(_PS_MANU_IMG_DIR_) as $dir) {
-                    if (preg_match('/^[0-9]+(\-(.*))?\.jpg$/', $dir)) {
-                        unlink(_PS_MANU_IMG_DIR_.$dir);
-                    }
-                }
-                foreach (scandir(_PS_SUPP_IMG_DIR_) as $dir) {
-                    if (preg_match('/^[0-9]+(\-(.*))?\.jpg$/', $dir)) {
-                        unlink(_PS_SUPP_IMG_DIR_.$dir);
-                    }
-                }
+                self::deleteEntityImages(_PS_MANU_IMG_DIR_);
+                self::deleteEntityImages(_PS_SUPP_IMG_DIR_);
                 break;
 
             case 'sales':
                 $tables = self::getSalesRelatedTables();
-
-                $modules_tables = array(
-                    'sekeywords' => array('sekeyword'),
-                    'pagesnotfound' => array('pagenotfound'),
-                    'paypal' => array('paypal_customer', 'paypal_order')
-                );
-
-                foreach ($modules_tables as $name => $module_tables) {
-                    if (Module::isInstalled($name)) {
-                        $tables = array_merge($tables, $module_tables);
-                    }
+                foreach (self::getInstalledModulesTables('sales') as $module_tables) {
+                    $tables = array_merge($tables, $module_tables);
                 }
 
                 foreach ($tables as $table) {
@@ -310,8 +296,135 @@ class PSCleaner extends Module
 
                 break;
         }
+
+        // Lets other modules empty the data they keep per product, category,
+        // customer or order (pscleaner cannot know their tables).
+        Hook::exec('actionPsCleanerTruncate', array('case' => $case));
+
         self::clearAllCaches();
         $db->execute('SET FOREIGN_KEY_CHECKS = 1;');
+    }
+
+    /**
+     * Tables of native/known modules that hold catalog or sales data, emptied
+     * only when the module is installed.
+     *
+     * @param string $case catalog|sales
+     *
+     * @return array<string, string[]> module name => tables (without prefix)
+     */
+    public static function getInstalledModulesTables($case)
+    {
+        $known = array(
+            'catalog' => array(
+                // Faceted search: price index, product attributes and the
+                // per-category / per-attribute filter data of the deleted catalog.
+                'ps_facetedsearch' => array(
+                    'layered_price_index',
+                    'layered_product_attribute',
+                    'layered_category',
+                    'layered_filter_block',
+                    'layered_indexable_attribute_group',
+                    'layered_indexable_attribute_group_lang_value',
+                    'layered_indexable_attribute_lang_value',
+                    'layered_indexable_feature',
+                    'layered_indexable_feature_lang_value',
+                    'layered_indexable_feature_value_lang_value',
+                ),
+            ),
+            'sales' => array(
+                'sekeywords' => array('sekeyword'),
+                'pagesnotfound' => array('pagenotfound'),
+                'paypal' => array('paypal_customer', 'paypal_order'),
+                // Newsletter subscribers are personal data.
+                'ps_emailsubscription' => array('emailsubscription'),
+                'statssearch' => array('statssearch'),
+                'ps_googleanalytics' => array('ganalytics', 'ganalytics_data'),
+            ),
+        );
+
+        $tables = array();
+        foreach (isset($known[$case]) ? $known[$case] : array() as $name => $module_tables) {
+            if (Module::isInstalled($name)) {
+                $tables[$name] = $module_tables;
+            }
+        }
+
+        return $tables;
+    }
+
+    /**
+     * Deletes the numbered images of an entity folder (img/c, img/m, img/su):
+     * "12.jpg", "12-default_md.jpg", "12_thumb.jpg", "12_thumb-small_default.webp"...
+     * Language placeholders ("cs-default-...") are kept.
+     *
+     * @param string $dir
+     */
+    protected static function deleteEntityImages($dir)
+    {
+        if (!is_dir($dir)) {
+            return;
+        }
+        foreach (scandir($dir) as $file) {
+            if (preg_match('/^[0-9]+([\-_].*)?\.(jpe?g|png|gif|webp|avif)$/i', $file) && is_file($dir.$file)) {
+                unlink($dir.$file);
+            }
+        }
+    }
+
+    /**
+     * Image::deleteAllImages() only removes .jpg files and keeps the folder
+     * when anything else is left, so the "fileType" marker (PrestaShop 8+) and
+     * webp/avif thumbnails left every numbered folder behind.
+     *
+     * @param string $path
+     */
+    protected static function deleteProductImages($path)
+    {
+        if (!is_dir($path)) {
+            return;
+        }
+        foreach (scandir($path) as $file) {
+            if (is_dir($path.$file) && preg_match('/^[0-9]$/', $file)) {
+                self::deleteProductImages($path.$file.'/');
+            } elseif (preg_match('/^[0-9]+(\-(.*))?\.(jpe?g|png|gif|webp|avif)$/i', $file) || ($file === 'fileType' && is_numeric(basename($path)))) {
+                unlink($path.$file);
+            }
+        }
+
+        if (is_numeric(basename($path))) {
+            $left = array_diff(scandir($path), array('.', '..', 'index.php'));
+            if (!$left) {
+                if (file_exists($path.'index.php')) {
+                    unlink($path.'index.php');
+                }
+                rmdir($path);
+            }
+        }
+    }
+
+    /**
+     * Deletes the files of product attachments and virtual products from the
+     * download folder. Only the files referenced by those tables are removed.
+     */
+    protected static function deleteCatalogDownloads()
+    {
+        $files = array();
+        foreach (array(array('attachment', 'file'), array('product_download', 'filename')) as $source) {
+            try {
+                $rows = Db::getInstance()->executeS('SELECT `'.$source[1].'` AS f FROM `'._DB_PREFIX_.$source[0].'`');
+            } catch (Exception $e) {
+                $rows = array();
+            }
+            foreach ((array) $rows as $row) {
+                $files[] = basename((string) $row['f']);
+            }
+        }
+        foreach (array_unique(array_filter($files)) as $file) {
+            if (!in_array($file, array('index.php', '.htaccess'), true) && is_file(_PS_DOWNLOAD_DIR_.$file)) {
+                unlink(_PS_DOWNLOAD_DIR_.$file);
+            }
+        }
     }
 
     public static function cleanAndOptimize()
@@ -689,6 +802,8 @@ class PSCleaner extends Module
             'product_carrier',
             'cart_product',
             'product_attachment',
+            'attachment',
+            'attachment_lang',
             'product_country_tax',
             'product_download',
             'product_group_reduction_cache',
